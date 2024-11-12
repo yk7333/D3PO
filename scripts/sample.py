@@ -3,6 +3,7 @@ import os
 import datetime
 import time
 import sys
+
 script_path = os.path.abspath(__file__)
 sys.path.append(os.path.dirname(os.path.dirname(script_path)))
 from absl import app, flags
@@ -36,6 +37,23 @@ NUM_PER_PROMPT = 7
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
 
 logger = get_logger(__name__)
+
+
+# Define the custom load_model_hook to manually load LoRA weights
+def load_model_hook(models, input_dir):
+    """
+    Custom load_model_hook to manually load LoRA weights.
+    This function replaces the default accelerate.load_state method.
+    """
+    assert len(models) == 1, "Only one model should be loaded at a time."
+    model = models[0]
+
+    if isinstance(model, AttnProcsLayers):
+        # Load LoRA weights
+        model.load_attn_procs(input_dir)
+        logger.info(f"LoRA weights loaded from {input_dir}")
+    else:
+        logger.warning("Non-LoRA model types are not handled in load_model_hook.")
 
 
 def main(_):
@@ -81,17 +99,26 @@ def main(_):
         gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
     )
 
-    # set a random seed
-    ramdom_seed = np.random.randint(0,100000)
-    set_seed(ramdom_seed, device_specific=True)
+    # Initialize trackers if main process
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name="d3po-pytorch",
+            config=config.to_dict(),
+            init_kwargs={"wandb": {"name": config.run_name}}
+        )
+    logger.info(f"\n{config}")
 
-    # load scheduler, tokenizer and models.
+    # Set a random seed
+    random_seed = np.random.randint(0, 100000)
+    set_seed(random_seed, device_specific=True)
+
+    # Load scheduler, tokenizer, and models
     pipeline = StableDiffusionPipeline.from_pretrained(config.pretrained.model, torch_dtype=torch.float16)
-    # freeze parameters of models to save more memory
-    pipeline.vae.requires_grad_(False)
-    pipeline.text_encoder.requires_grad_(False)
-    pipeline.unet.requires_grad_(not config.use_lora)
-    # disable safety checker
+    # Freeze parameters of models to save more memory
+    pipeline.vae.requires_grad = False
+    pipeline.text_encoder.requires_grad = False
+    pipeline.unet.requires_grad = not config.use_lora
+    # Disable safety checker
     pipeline.safety_checker = None
     # make the progress bar nicer
     pipeline.set_progress_bar_config(
@@ -104,7 +131,7 @@ def main(_):
     # switch to DDIM scheduler
     pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
     total_image_num_per_gpu = config.sample.batch_size * config.sample.num_batches_per_epoch * NUM_PER_PROMPT
-    global_idx = accelerator.process_index * total_image_num_per_gpu 
+    global_idx = accelerator.process_index * total_image_num_per_gpu
     local_idx = 0
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -117,7 +144,7 @@ def main(_):
     # Move unet, vae and text_encoder to device and cast to inference_dtype
     pipeline.vae.to(accelerator.device, dtype=inference_dtype)
     pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
-    
+
     if config.use_lora:
         pipeline.unet.to(accelerator.device, dtype=inference_dtype)
 
@@ -138,18 +165,7 @@ def main(_):
                 hidden_size = pipeline.unet.config.block_out_channels[block_id]
 
             lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
-        for name in pipeline.unet.attn_processors.keys():
-            cross_attention_dim = (
-                None if name.endswith("attn1.processor") else pipeline.unet.config.cross_attention_dim
-            )
-            if name.startswith("mid_block"):
-                hidden_size = pipeline.unet.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(pipeline.unet.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = pipeline.unet.config.block_out_channels[block_id]
+
         pipeline.unet.set_attn_processor(lora_attn_procs)
         trainable_layers = AttnProcsLayers(pipeline.unet.attn_processors)
     else:
@@ -179,7 +195,7 @@ def main(_):
     )
     # prepare prompt and reward fn
     prompt_fn = getattr(d3po_pytorch.prompts, config.prompt_fn)
-    
+
     # generate negative prompt embeddings
     neg_prompt_embed = pipeline.text_encoder(
         pipeline.tokenizer(
@@ -196,25 +212,40 @@ def main(_):
     # Prepare everything with our `accelerator`.
     trainable_layers, optimizer = accelerator.prepare(trainable_layers, optimizer)
 
+    #################### LOAD CHECKPOINT MANUALLY ####################
     if config.resume_from:
         logger.info(f"Resuming from {config.resume_from}")
-        accelerator.load_state(config.resume_from)
+        # Manually load the LoRA weights using the custom load_model_hook
+        load_model_hook([trainable_layers], config.resume_from)  # MODIFIED: Removed empty list argument
+
+        # Load optimizer state
+        optimizer_state_path = os.path.join(config.resume_from, "optimizer.bin")
+        if os.path.exists(optimizer_state_path):
+            optimizer.load_state_dict(torch.load(optimizer_state_path))
+            logger.info(f"Optimizer state loaded from {optimizer_state_path}")
+        else:
+            logger.warning(f"Optimizer state not found at {optimizer_state_path}")
+
+        # Optionally, load random states if necessary
+        # Skipping loading random_states_*.pkl to avoid UnpicklingError
+        # If you need to load them, you must define a persistent_load function
+        # which is beyond the scope of this guide.
 
     #################### SAMPLING ####################
     pipeline.unet.eval()
     samples = []
     total_prompts = []
     for i in tqdm(
-        range(config.sample.num_batches_per_epoch),
-        disable=not accelerator.is_local_main_process,
-        position=0,
+            range(config.sample.num_batches_per_epoch),
+            disable=not accelerator.is_local_main_process,
+            position=0,
     ):
         # generate prompts
         prompts1, prompt_metadata = zip(
             *[prompt_fn(**config.prompt_fn_kwargs) for _ in range(config.sample.batch_size)]
         )
         # we set the prompts to be the same
-        # prompts1 = ["1 hand"] * config.sample.batch_size 
+        # prompts1 = ["1 hand"] * config.sample.batch_size
         prompts7 = prompts6 = prompts5 = prompts4 = prompts3 = prompts2 = prompts1
         total_prompts.extend(prompts1)
         # encode prompts
@@ -302,7 +333,7 @@ def main(_):
                 guidance_scale=config.sample.guidance_scale,
                 eta=config.sample.eta,
                 output_type="pt",
-                latents = latents1[:,0,:,:,:]
+                latents=latents1[:, 0, :, :, :]
             )
             latents2 = torch.stack(latents2, dim=1)
             images2 = images2.cpu().detach()
@@ -316,7 +347,7 @@ def main(_):
                 guidance_scale=config.sample.guidance_scale,
                 eta=config.sample.eta,
                 output_type="pt",
-                latents = latents1[:,0,:,:,:]
+                latents=latents1[:, 0, :, :, :]
             )
             latents3 = torch.stack(latents3, dim=1)
             images3 = images3.cpu().detach()
@@ -330,7 +361,7 @@ def main(_):
                 guidance_scale=config.sample.guidance_scale,
                 eta=config.sample.eta,
                 output_type="pt",
-                latents = latents1[:,0,:,:,:]
+                latents=latents1[:, 0, :, :, :]
             )
             latents4 = torch.stack(latents4, dim=1)
             images4 = images4.cpu().detach()
@@ -344,7 +375,7 @@ def main(_):
                 guidance_scale=config.sample.guidance_scale,
                 eta=config.sample.eta,
                 output_type="pt",
-                latents = latents1[:,0,:,:,:]
+                latents=latents1[:, 0, :, :, :]
             )
             latents5 = torch.stack(latents5, dim=1)
             images5 = images5.cpu().detach()
@@ -358,7 +389,7 @@ def main(_):
                 guidance_scale=config.sample.guidance_scale,
                 eta=config.sample.eta,
                 output_type="pt",
-                latents = latents1[:,0,:,:,:]
+                latents=latents1[:, 0, :, :, :]
             )
             latents6 = torch.stack(latents6, dim=1)
             images6 = images6.cpu().detach()
@@ -371,19 +402,21 @@ def main(_):
                 guidance_scale=config.sample.guidance_scale,
                 eta=config.sample.eta,
                 output_type="pt",
-                latents = latents1[:,0,:,:,:]
+                latents=latents1[:, 0, :, :, :]
             )
             latents7 = torch.stack(latents7, dim=1)
             images7 = images7.cpu().detach()
             latents7 = latents7.cpu().detach()
 
-        latents = torch.stack([latents1,latents2,latents3,latents4,latents5,latents6,latents7], dim=1)  # (batch_size, 2, num_steps + 1, 4, 64, 64)
-        prompt_embeds = torch.stack([prompt_embeds1,prompt_embeds2,prompt_embeds3,prompt_embeds4,prompt_embeds5,prompt_embeds6,prompt_embeds7], dim=1)
-        images = torch.stack([images1,images2,images3,images4,images5,images6,images7], dim=1)
+        latents = torch.stack([latents1, latents2, latents3, latents4, latents5, latents6, latents7],
+                              dim=1)  # (batch_size, 2, num_steps + 1, 4, 64, 64)
+        prompt_embeds = torch.stack(
+            [prompt_embeds1, prompt_embeds2, prompt_embeds3, prompt_embeds4, prompt_embeds5, prompt_embeds6,
+             prompt_embeds7], dim=1)
+        images = torch.stack([images1, images2, images3, images4, images5, images6, images7], dim=1)
         current_latents = latents[:, :, :-1]
         next_latents = latents[:, :, 1:]
         timesteps = pipeline.scheduler.timesteps.repeat(config.sample.batch_size, 1)  # (batch_size, num_steps)
-
 
         samples.append(
             {
@@ -391,34 +424,44 @@ def main(_):
                 "timesteps": timesteps.cpu().detach(),
                 "latents": current_latents.cpu().detach(),  # each entry is the latent before timestep t
                 "next_latents": next_latents.cpu().detach(),  # each entry is the latent after timestep t
-                "images":images.cpu().detach(),
+                "images": images.cpu().detach(),
             }
         )
         os.makedirs(os.path.join(save_dir, "images/"), exist_ok=True)
-        if (i+1)%config.sample.save_interval ==0 or i==(config.sample.num_batches_per_epoch-1):
+        if (i + 1) % config.sample.save_interval == 0 or i == (config.sample.num_batches_per_epoch - 1):
             print(f'-----------{accelerator.process_index} save image start-----------')
             new_samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
             images = new_samples['images'][local_idx:]
             for j, image in enumerate(images):
                 for k in range(NUM_PER_PROMPT):
                     pil = Image.fromarray((image[k].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
-                    pil.save(os.path.join(save_dir, f"images/{(NUM_PER_PROMPT*j+global_idx+k):05}.png"))
-            global_idx += len(images)*NUM_PER_PROMPT
+                    pil.save(os.path.join(save_dir, f"images/{(NUM_PER_PROMPT * j + global_idx + k):05}.png"))
+            global_idx += len(images) * NUM_PER_PROMPT
             local_idx += len(images)
-            with open(os.path.join(save_dir, f'prompt{accelerator.process_index}.json'),'w') as f:
+            with open(os.path.join(save_dir, f'prompt{accelerator.process_index}.json'), 'w') as f:
                 json.dump(total_prompts, f)
             with open(os.path.join(save_dir, f'sample{accelerator.process_index}.pkl'), 'wb') as f:
-                pickle.dump({"prompt_embeds": new_samples["prompt_embeds"], "timesteps": new_samples["timesteps"], "latents": new_samples["latents"], "next_latents": new_samples["next_latents"]}, f)
+                pickle.dump({
+                    "prompt_embeds": new_samples["prompt_embeds"],
+                    "timesteps": new_samples["timesteps"],
+                    "latents": new_samples["latents"],
+                    "next_latents": new_samples["next_latents"]
+                }, f)
+
+    # Save a done flag for each process
     with open(os.path.join(save_dir, f'{accelerator.process_index}.txt'), 'w') as f:
         f.write(f'{accelerator.process_index} done')
         print(f'GPU: {accelerator.device} done')
     if accelerator.is_main_process:
         while True:
-            done = [True if os.path.exists(os.path.join(save_dir, f'{i}.txt')) else False for i in range(accelerator.num_processes)]
+            done = [True if os.path.exists(os.path.join(save_dir, f'{i}.txt')) else False for i in
+                    range(accelerator.num_processes)]
             if all(done):
                 time.sleep(5)
                 break
         print('---------start post processing---------')
         post_processing(save_dir, accelerator.num_processes)
+
+
 if __name__ == "__main__":
     app.run(main)
