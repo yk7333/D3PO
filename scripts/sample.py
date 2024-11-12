@@ -33,7 +33,7 @@ save_dir = './data'
 save_dir = os.path.join(save_dir, now_time)
 
 FLAGS = flags.FLAGS
-NUM_PER_PROMPT = 5
+NUM_PER_PROMPT = 7
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
 
 logger = get_logger(__name__)
